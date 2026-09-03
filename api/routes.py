@@ -13898,7 +13898,24 @@ def handle_get(handler, parsed) -> bool:
                 )
                 if revision:
                     raw["regeneration_revision"] = revision
+            # perf(conversation-switch): full-transcript loads splice the
+            # persisted per-message redaction cache (t5 stage); limited views
+            # and non-load requests are cheap enough to redact directly.
+            _transcript_lists = {}
+            if load_messages and msg_limit is None:
+                for _tk in ("messages", "context_messages"):
+                    if _tk in raw:
+                        _transcript_lists[_tk] = raw.pop(_tk)
+            try:
+                from api.process_event_utils import build_active_turn_token as _build_turn_token
+                _active_turn_token = _build_turn_token(raw.get("active_stream_id"), raw.get("pending_started_at"))
+            except Exception:
+                _active_turn_token = None
             redact = redact_session_data(raw)
+            if _transcript_lists:
+                from api.helpers import redact_session_lists_cached
+                redact.update(redact_session_lists_cached(
+                    sid, _transcript_lists, _active_turn_token=_active_turn_token))
             _t5 = _time.monotonic()
             if _diag: _diag.stage("t5_after_redact")
             resp = j(handler, {"session": redact})

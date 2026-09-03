@@ -1292,6 +1292,135 @@ def redact_session_data(session_dict: dict) -> dict:
     return result
 
 
+# ── Session transcript redaction cache (perf: conversation-switch cold load) ──
+# `redact_session_data()` re-sweeps every message string on every load. With the
+# per-string decision memo (above) repeat loads of the same in-memory objects
+# are fast, but each /api/session request re-parses the session file into FRESH
+# string objects, so a cold first touch of a large session still paid the full
+# sweep (~1.5s for a 2101-message / 14MB transcript).
+#
+# This derived cache persists the redacted public projection of a session's
+# transcript lists on disk, keyed by per-message content digests. Loads splice
+# cached projections for unchanged messages (zero redaction work — transcripts
+# are append-mostly) and recompute only appended/changed items. The cache file
+# is a derived artifact: any parse/validation failure falls back to plain
+# redaction, and stored projections are DECORATION-FREE — the per-request
+# `_active_turn_user` flag is applied after retrieval from the CURRENT
+# request's turn token, never persisted.
+_REDACT_SESSION_CACHE_VERSION = 1
+
+
+def _redact_session_cache_path(session_id):
+    from api.config import STATE_DIR
+    return STATE_DIR / "redaction_cache" / f"{session_id}.json"
+
+
+def _redact_item_digest(value) -> str:
+    import hashlib
+    return hashlib.sha256(
+        _json.dumps(value, sort_keys=True, default=str, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _redact_apply_turn_decoration(raw_items, projected_items, _active_turn_token):
+    """Mirror `_public_message_projection`'s active-turn flag onto a cached
+    (decoration-free) projection, using the CURRENT request's token."""
+    if _active_turn_token is None or not isinstance(raw_items, list) or not isinstance(projected_items, list):
+        return projected_items
+    for raw_msg, out_msg in zip(raw_items, projected_items):
+        if (
+            isinstance(raw_msg, dict) and isinstance(out_msg, dict)
+            and raw_msg.get("role") == "user"
+            and raw_msg.get("_active_turn_token") == _active_turn_token
+        ):
+            out_msg["_active_turn_user"] = True
+    return projected_items
+
+
+def redact_session_lists_cached(session_id, lists: dict, *, _active_turn_token=None) -> dict:
+    """Redact transcript lists (`messages`, `context_messages`, ...) through the
+    persistent per-message derived cache.
+
+    Falls back to plain redaction on ANY cache failure — this is a derived
+    artifact, never a correctness dependency. Respects `api_redact_enabled`
+    (the setting is part of cache validation, so toggling it recomputes).
+    """
+    from api.config import load_settings
+    _enabled = bool(load_settings().get("api_redact_enabled", True))
+
+    out = {}
+    want = {}
+    wrote = False
+    path = None
+    try:
+        path = _redact_session_cache_path(session_id)
+        cache = None
+        if path.exists():
+            try:
+                loaded = _json.loads(path.read_text(encoding="utf-8"))
+                if (isinstance(loaded, dict)
+                        and loaded.get("v") == _REDACT_SESSION_CACHE_VERSION
+                        and loaded.get("enabled") == _enabled):
+                    cache = loaded
+            except Exception:
+                cache = None
+        cached_digests = (cache or {}).get("digests") or {}
+        cached_lists = (cache or {}).get("lists") or {}
+        projected_by_key = {}
+        for key, items in lists.items():
+            if not isinstance(items, list):
+                out[key] = _redact_messages(items, _enabled=_enabled, _active_turn_token=_active_turn_token)
+                continue
+            digests = [_redact_item_digest(it) for it in items]
+            want[key] = digests
+            old_digests = cached_digests.get(key) if isinstance(cached_digests, dict) else None
+            old_items = cached_lists.get(key) if isinstance(cached_lists, dict) else None
+            projected = [None] * len(items)
+            reused = 0
+            if (isinstance(old_digests, list) and isinstance(old_items, list)):
+                # Transcripts are append-mostly: splice the common prefix and
+                # recompute only appended/changed items.
+                common = min(len(old_digests), len(digests), len(old_items))
+                for i in range(common):
+                    if old_digests[i] == digests[i] and old_items[i] is not None:
+                        projected[i] = old_items[i]
+                        reused += 1
+            for i, item in enumerate(items):
+                if projected[i] is None:
+                    projected[i] = _redact_messages([item], _enabled=_enabled)[0]
+            projected_by_key[key] = projected
+            out[key] = projected
+            if reused != len(digests):
+                wrote = True
+        if wrote and path is not None:
+            # Write DECORATION-FREE projections (must happen before the
+            # response-only turn decoration below mutates `out`).
+            payload = {
+                "v": _REDACT_SESSION_CACHE_VERSION,
+                "enabled": _enabled,
+                "digests": want,
+                "lists": {k: projected_by_key[k] for k in want},
+            }
+            try:
+                import os as _os
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(f".{_os.getpid()}.tmp")
+                tmp.write_text(_json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                _os.replace(tmp, path)
+            except Exception:
+                pass
+        for key, items in lists.items():
+            if key in projected_by_key:
+                _redact_apply_turn_decoration(items, projected_by_key[key], _active_turn_token)
+        return out
+    except Exception:
+        # Cache is best-effort; never fail a response over it.
+        return {
+            key: _redact_messages(items, _enabled=_enabled, _active_turn_token=_active_turn_token)
+            for key, items in lists.items()
+        }
+
+
 def read_body(handler) -> dict:
     """Read and JSON-parse a POST request body (capped at 20MB)."""
     raw_length = handler.headers.get('Content-Length', 0)
