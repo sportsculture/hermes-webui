@@ -466,7 +466,7 @@ _redact_fn_uncached = _build_redact_fn()
 # the GIL and surface as "Mất kết nối" in the browser. The redactor is pure and
 # deterministic (force=True, fixed masking), so identical strings always map to
 # identical output and are safe to memoize without invalidation.
-_redact_fn_lru = functools.lru_cache(maxsize=4096)(_redact_fn_uncached)
+_redact_fn_lru = functools.lru_cache(maxsize=32768)(_redact_fn_uncached)
 
 # Cap per-entry size so a handful of giant tool-output dumps can't evict the
 # thousands of small recurring strings that actually benefit, or balloon RSS.
@@ -477,6 +477,28 @@ def _redact_fn_cached(text):
     if len(text) > _REDACT_CACHE_MAX_TEXT_LEN:
         return _redact_fn_uncached(text)
     return _redact_fn_lru(text)
+
+
+# perf(conversation-switch latency, 2026-09-03): profiling a live switch to a
+# 2101-message / 14MB session showed that even with the redactor memoized,
+# ~100% of the remaining per-pass cost was `_might_contain_sensitive_text`
+# re-scanning every string of every message on EVERY load. The prefilter is
+# pure/deterministic like the redactor, so the entire clean-or-redacted
+# DECISION is memoized here: warm passes become dict lookups, and CPython
+# caches str hashes on the string objects themselves, so sessions held in the
+# compact-session LRU skip even the hash cost. Two tiers mirror the redactor
+# memo: small (≤16KiB, 32768 entries) and big (≤256KiB, 1024 entries —
+# worst-case tier RSS ≈ 256MB, typically tens of MB). Strings above the big
+# ceiling stay uncached (rare giant dumps).
+def _redact_text_impl(text: str) -> str:
+    if not _might_contain_sensitive_text(text):
+        return text
+    return _redact_fn_cached(text)
+
+
+_redact_text_lru = functools.lru_cache(maxsize=32768)(_redact_text_impl)
+_redact_text_big_lru = functools.lru_cache(maxsize=1024)(_redact_text_impl)
+_REDACT_TEXT_BIG_CACHE_MAX = 262144
 
 
 _SENSITIVE_CASE_MARKERS = (
@@ -558,15 +580,33 @@ _SENSITIVE_TELEGRAM_MARKER_RE = _re.compile(r"(?:bot)?\d{8,}:[-A-Za-z0-9_]{30,}"
 _SENSITIVE_DISCORD_MARKER_RE = _re.compile(r"<@!?\d{17,20}>")
 _SENSITIVE_PHONE_MARKER_RE = _re.compile(r"(?<![A-Za-z0-9])\+[1-9]\d{6,14}(?![A-Za-z0-9])")
 
+# perf(conversation-switch latency, 2026-09-03): this prefilter runs over
+# every string of every message on every session load; ~30 per-marker `in`
+# scans plus a text.lower() full-string copy made it the dominant per-byte
+# cost. Two compiled alternations preserve exact membership semantics (case
+# set = case-sensitive substring; lower set = case-insensitive substring).
+# Longest-first ordering avoids the re engine stopping at a shorter prefix.
+_SENSITIVE_CASE_MARKER_RE = _re.compile(
+    "|".join(
+        sorted((_re.escape(m) for m in _SENSITIVE_CASE_MARKERS if m), key=len, reverse=True)
+    )
+)
+_SENSITIVE_LOWER_MARKER_RE = _re.compile(
+    "|"
+    .join(
+        sorted((_re.escape(m) for m in _SENSITIVE_LOWER_MARKERS if m), key=len, reverse=True)
+    ),
+    _re.IGNORECASE,
+)
+
 
 def _might_contain_sensitive_text(text: str) -> bool:
     """Cheap prefilter before the full agent+fallback redaction pass."""
     if not isinstance(text, str) or not text:
         return False
-    if any(marker in text for marker in _SENSITIVE_CASE_MARKERS):
+    if _SENSITIVE_CASE_MARKER_RE.search(text):
         return True
-    lower = text.lower()
-    if any(marker in lower for marker in _SENSITIVE_LOWER_MARKERS):
+    if _SENSITIVE_LOWER_MARKER_RE.search(text):
         return True
     if ":" in text and _SENSITIVE_TELEGRAM_MARKER_RE.search(text):
         return True
@@ -584,6 +624,11 @@ def _redact_text(text: str, *, _enabled: bool | None = None) -> str:
     redact many strings in a single response — `redact_session_data()` reads
     the setting once and threads it through ``_redact_value`` so we avoid
     re-loading settings.json from disk per string. (Opus pre-release perf fix.)
+
+    perf(2026-09-03): routes through the per-string decision memo so repeat
+    loads of the same session skip both the prefilter and the redaction pass
+    (see `_redact_text_impl`). Enabled=False bypasses the memo entirely, so
+    the cache only ever holds enabled=True results — no staleness on toggle.
     """
     if not isinstance(text, str) or not text:
         return text
@@ -592,9 +637,12 @@ def _redact_text(text: str, *, _enabled: bool | None = None) -> str:
         _enabled = bool(load_settings().get("api_redact_enabled", True))
     if not _enabled:
         return text
-    if not _might_contain_sensitive_text(text):
-        return text
-    return _redact_fn_cached(text)
+    n = len(text)
+    if n <= _REDACT_CACHE_MAX_TEXT_LEN:
+        return _redact_text_lru(text)
+    if n <= _REDACT_TEXT_BIG_CACHE_MAX:
+        return _redact_text_big_lru(text)
+    return _redact_text_impl(text)
 
 
 _RASTER_IMAGE_DATA_URI_PREFIXES = (
