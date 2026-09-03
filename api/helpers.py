@@ -1299,6 +1299,12 @@ def redact_session_data(session_dict: dict) -> dict:
 # string objects, so a cold first touch of a large session still paid the full
 # sweep (~1.5s for a 2101-message / 14MB transcript).
 #
+# NOTE: the on-disk cache survives process restarts and upgrades (unlike the
+# in-memory LRUs), so validation includes a rules fingerprint (schema version +
+# WebUI version + agent redactor module stat). Bump _REDACT_SESSION_CACHE_VERSION
+# whenever the projection shape or the internal-field set changes in a way a
+# fingerprint can't see.
+#
 # This derived cache persists the redacted public projection of a session's
 # transcript lists on disk, keyed by per-message content digests. Loads splice
 # cached projections for unchanged messages (zero redaction work — transcripts
@@ -1310,7 +1316,35 @@ def redact_session_data(session_dict: dict) -> dict:
 _REDACT_SESSION_CACHE_VERSION = 1
 
 
+def _redact_session_cache_rules_key() -> str:
+    """Fingerprint of everything the cached projections depend on besides the
+    message content: the cache schema version, the WebUI version (projection
+    shape / internal-field set), and the agent redactor module file (credential
+    patterns can advance independently of the WebUI via the mounted checkout).
+    A mismatch forces a full recompute — this is the guard that keeps a stale
+    cache from serving credentials the CURRENT redactor would catch."""
+    import hashlib
+    parts = [str(_REDACT_SESSION_CACHE_VERSION)]
+    try:
+        from api.config import _current_webui_version
+        parts.append(str(_current_webui_version() or ""))
+    except Exception:
+        parts.append("")
+    try:
+        import agent.redact as _agent_redact
+        st = os.stat(_agent_redact.__file__)
+        parts.append(f"{st.st_mtime_ns}:{st.st_size}")
+    except Exception:
+        parts.append("")
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+
+
 def _redact_session_cache_path(session_id):
+    # session_id is interpolated into a filename — reject traversal shapes.
+    if (not isinstance(session_id, str) or not session_id
+            or "/" in session_id or "\\" in session_id
+            or session_id in (".", "..")):
+        raise ValueError(f"unsafe session id for redaction cache: {session_id!r}")
     from api.config import STATE_DIR
     return STATE_DIR / "redaction_cache" / f"{session_id}.json"
 
@@ -1327,7 +1361,7 @@ def _redact_apply_turn_decoration(raw_items, projected_items, _active_turn_token
     (decoration-free) projection, using the CURRENT request's token."""
     if _active_turn_token is None or not isinstance(raw_items, list) or not isinstance(projected_items, list):
         return projected_items
-    for raw_msg, out_msg in zip(raw_items, projected_items):
+    for raw_msg, out_msg in zip(raw_items, projected_items, strict=False):
         if (
             isinstance(raw_msg, dict) and isinstance(out_msg, dict)
             and raw_msg.get("role") == "user"
@@ -1347,12 +1381,22 @@ def redact_session_lists_cached(session_id, lists: dict, *, _active_turn_token=N
     """
     from api.config import load_settings
     _enabled = bool(load_settings().get("api_redact_enabled", True))
+    if not _enabled:
+        # perf(conversation-switch, review follow-up): never persist an
+        # UNREDACTED projection cache — with redaction off, the derived file
+        # would be a second on-disk copy of the very secrets this boundary
+        # exists to keep out of derived artifacts. Passthrough is cheap.
+        return {
+            key: _redact_messages(items, _enabled=False, _active_turn_token=_active_turn_token)
+            for key, items in lists.items()
+        }
 
     out = {}
     want = {}
     wrote = False
     path = None
     try:
+        rules_key = _redact_session_cache_rules_key()
         path = _redact_session_cache_path(session_id)
         cache = None
         if path.exists():
@@ -1360,6 +1404,7 @@ def redact_session_lists_cached(session_id, lists: dict, *, _active_turn_token=N
                 loaded = _json.loads(path.read_text(encoding="utf-8"))
                 if (isinstance(loaded, dict)
                         and loaded.get("v") == _REDACT_SESSION_CACHE_VERSION
+                        and loaded.get("rules_key") == rules_key
                         and loaded.get("enabled") == _enabled):
                     cache = loaded
             except Exception:
@@ -1397,16 +1442,22 @@ def redact_session_lists_cached(session_id, lists: dict, *, _active_turn_token=N
             # response-only turn decoration below mutates `out`).
             payload = {
                 "v": _REDACT_SESSION_CACHE_VERSION,
+                "rules_key": rules_key,
                 "enabled": _enabled,
                 "digests": want,
                 "lists": {k: projected_by_key[k] for k in want},
             }
             try:
-                import os as _os
+                import tempfile
                 path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = path.with_suffix(f".{_os.getpid()}.tmp")
-                tmp.write_text(_json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-                _os.replace(tmp, path)
+                fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f"{path.stem}.", suffix=".tmp")
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fh.write(_json.dumps(payload, ensure_ascii=False))
+                    os.replace(tmp_name, path)
+                finally:
+                    if os.path.exists(tmp_name):
+                        os.unlink(tmp_name)
             except Exception:
                 pass
         for key, items in lists.items():

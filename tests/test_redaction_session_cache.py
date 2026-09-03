@@ -45,7 +45,6 @@ def _spy(monkeypatch):
 
 
 def test_cold_computes_persists_and_redacts(state_dir):
-    spy = _spy(pytest.monkeypatch) if False else None  # placeholder (see below)
     msgs = _msgs()
     out = redact_session_lists_cached("sessA", {"messages": msgs})
     assert _SECRET_STATE_OK(out)
@@ -89,8 +88,10 @@ def test_change_to_existing_message_recomputes_it(state_dir, monkeypatch):
     calls = _spy(monkeypatch)
     msgs = _msgs()
     redact_session_lists_cached("sessD", {"messages": msgs})
+    assert calls["n"] == 2
     msgs[1]["content"] = "assistant reply was edited"
     out = redact_session_lists_cached("sessD", {"messages": msgs})
+    assert calls["n"] == 3  # the edited message was recomputed
     assert out["messages"][1]["content"] == "assistant reply was edited"
 
 
@@ -128,3 +129,32 @@ def test_turn_decoration_applied_but_never_persisted(state_dir):
     # a later request without the token must not see a stale flag
     out2 = redact_session_lists_cached("sessG", {"messages": msgs})
     assert all("_active_turn_user" not in m for m in out2["messages"])
+
+
+def test_midlist_insertion_never_serves_stale_projection(state_dir):
+    # Insert at index 0 shifts every digest: the splice must not pair old
+    # projections with the wrong messages.
+    msgs = [
+        {"role": "user", "content": "alpha message"},
+        {"role": "assistant", "content": "beta reply"},
+    ]
+    redact_session_lists_cached("sessIns", {"messages": msgs})
+    msgs.insert(0, {"role": "user", "content": "zeroth inserted message"})
+    out = redact_session_lists_cached("sessIns", {"messages": msgs})
+    assert [m["content"] for m in out["messages"]] == [
+        "zeroth inserted message", "alpha message", "beta reply",
+    ]
+
+
+def test_truncation_serves_matching_prefix(state_dir, monkeypatch):
+    calls = _spy(monkeypatch)
+    msgs = [
+        {"role": "user", "content": "keep one"},
+        {"role": "assistant", "content": "keep two"},
+        {"role": "user", "content": "drop three"},
+    ]
+    redact_session_lists_cached("sessTrunc", {"messages": msgs})
+    assert calls["n"] == 3
+    out = redact_session_lists_cached("sessTrunc", {"messages": msgs[:2]})
+    assert calls["n"] == 3  # prefix spliced, nothing recomputed
+    assert [m["content"] for m in out["messages"]] == ["keep one", "keep two"]
