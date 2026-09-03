@@ -487,8 +487,11 @@ def _redact_fn_cached(text):
 # DECISION is memoized here: warm passes become dict lookups, and CPython
 # caches str hashes on the string objects themselves, so sessions held in the
 # compact-session LRU skip even the hash cost. Two tiers mirror the redactor
-# memo: small (≤16KiB, 32768 entries) and big (≤256KiB, 1024 entries —
-# worst-case tier RSS ≈ 256MB, typically tens of MB). Strings above the big
+# memo: small (≤16KiB, 32768 entries) and big (≤256KiB, 1024 entries).
+# Worst-case tier RSS: big tier stores keys+values ≈ 512MB, small tier
+# ≈ 512MB, redactor memo ≈ 64MB — ~1GB theoretical ceiling; realistic
+# occupancy is tens of MB (clean strings alias their key objects, and
+# recurring short strings dominate). Strings above the big
 # ceiling stay uncached (rare giant dumps).
 def _redact_text_impl(text: str) -> str:
     if not _might_contain_sensitive_text(text):
