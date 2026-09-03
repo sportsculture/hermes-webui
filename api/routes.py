@@ -15978,6 +15978,16 @@ def handle_post(handler, parsed) -> bool:
             delete_turn_journal(sid)
         except Exception:
             logger.debug("Failed to delete turn journal for deleted session %s", sid)
+        # The persisted redaction projection (STATE_DIR/redaction_cache/) is a
+        # derived artifact; unlike the journals it holds redacted text, but the
+        # surviving conversation still belongs to the deleted session (#7414
+        # follow-up).
+        try:
+            from api.helpers import delete_redaction_session_cache
+
+            delete_redaction_session_cache(sid)
+        except Exception:
+            logger.debug("Failed to delete redaction cache for deleted session %s", sid)
         try:
             from api.run_journal import delete_run_journal
 
@@ -22238,6 +22248,12 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
                 with LOCK:
                     SESSIONS.pop(p.stem, None)
                 p.unlink(missing_ok=True)
+                try:
+                    from api.helpers import delete_redaction_session_cache
+
+                    delete_redaction_session_cache(p.stem)
+                except Exception:
+                    pass
                 cleaned += 1
                 phase1_removed_ids.add(p.stem)
         except Exception:
@@ -22469,6 +22485,12 @@ def _handle_background(handler, body):
             # next rebuild via _index_entry_exists().
             try:
                 (SESSION_DIR / f"{bg_sid}.json").unlink(missing_ok=True)
+                try:
+                    from api.helpers import delete_redaction_session_cache
+
+                    delete_redaction_session_cache(bg_sid)
+                except Exception:
+                    pass
             except Exception:
                 pass
         except Exception:

@@ -9,13 +9,16 @@ Locks:
   * `api_redact_enabled` participates in validation (toggle recomputes),
   * the per-request `_active_turn_user` decoration is applied after retrieval
     and is NEVER persisted to the cache file.
+  * `delete_redaction_session_cache` removes the file on session deletion
+    (deleted conversations must not linger in `redaction_cache/`) and is a
+    safe no-op for missing/unsafe ids.
 """
 import json
 
 import pytest
 
 from api import helpers as H
-from api.helpers import redact_session_lists_cached
+from api.helpers import delete_redaction_session_cache, redact_session_lists_cached
 
 
 @pytest.fixture()
@@ -158,3 +161,30 @@ def test_truncation_serves_matching_prefix(state_dir, monkeypatch):
     out = redact_session_lists_cached("sessTrunc", {"messages": msgs[:2]})
     assert calls["n"] == 3  # prefix spliced, nothing recomputed
     assert [m["content"] for m in out["messages"]] == ["keep one", "keep two"]
+
+
+def test_delete_removes_cache_file_leaves_sibling_intact(state_dir):
+    # Deleting a session must remove its redaction-cache file (a deleted
+    # conversation is not recoverable from redaction_cache/), while an
+    # unrelated session's cache is untouched.
+    redact_session_lists_cached("sessDel", {"messages": _msgs()})
+    redact_session_lists_cached("sessKeep", {"messages": _msgs()})
+    doomed = state_dir / "redaction_cache" / "sessDel.json"
+    sibling = state_dir / "redaction_cache" / "sessKeep.json"
+    assert doomed.exists() and sibling.exists()
+    assert delete_redaction_session_cache("sessDel") is True
+    assert not doomed.exists()
+    assert sibling.exists()
+    # second delete is a no-op
+    assert delete_redaction_session_cache("sessDel") is False
+
+
+def test_delete_noop_on_missing_or_invalid(state_dir):
+    assert delete_redaction_session_cache("nope") is False
+    assert delete_redaction_session_cache("") is False
+    assert delete_redaction_session_cache("../escape") is False
+    assert delete_redaction_session_cache("..\\escape") is False
+    assert delete_redaction_session_cache(".") is False
+    # nothing escaped the cache dir
+    assert list((state_dir / "redaction_cache").glob("*.json")) == []
+    assert (state_dir / "escape.json").exists() is False

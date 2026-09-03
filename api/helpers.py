@@ -1315,7 +1315,9 @@ def redact_session_data(session_dict: dict) -> dict:
 # is a derived artifact: any parse/validation failure falls back to plain
 # redaction, and stored projections are DECORATION-FREE — the per-request
 # `_active_turn_user` flag is applied after retrieval from the CURRENT
-# request's turn token, never persisted.
+# request's turn token, never persisted. Delete the file when the session is
+# deleted (delete_redaction_session_cache) so a deleted conversation is not
+# recoverable from redaction_cache/.
 _REDACT_SESSION_CACHE_VERSION = 1
 
 
@@ -1473,6 +1475,29 @@ def redact_session_lists_cached(session_id, lists: dict, *, _active_turn_token=N
             key: _redact_messages(items, _enabled=_enabled, _active_turn_token=_active_turn_token)
             for key, items in lists.items()
         }
+
+
+def delete_redaction_session_cache(session_id) -> bool:
+    """Remove the persisted redaction projection for ``session_id``.
+
+    Hooked into the session-deletion paths so a deleted conversation is not
+    recoverable from ``STATE_DIR/redaction_cache/`` (same rationale as #3802
+    for the turn/run journals: the file holds redacted projections, but the
+    surviving conversation text still belongs to the deleted session).
+    Unsafe ids and a missing file are a no-op; returns True only if a file
+    was actually removed. Best-effort — never raises.
+    """
+    try:
+        path = _redact_session_cache_path(session_id)
+    except Exception:
+        return False
+    try:
+        if not path.exists():
+            return False
+        path.unlink(missing_ok=True)
+    except OSError:
+        return False
+    return not path.exists()
 
 
 def read_body(handler) -> dict:
