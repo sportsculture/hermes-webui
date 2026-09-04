@@ -1303,10 +1303,13 @@ def redact_session_data(session_dict: dict) -> dict:
 # sweep (~1.5s for a 2101-message / 14MB transcript).
 #
 # NOTE: the on-disk cache survives process restarts and upgrades (unlike the
-# in-memory LRUs), so validation includes a rules fingerprint (schema version +
-# WebUI version + agent redactor module stat). Bump _REDACT_SESSION_CACHE_VERSION
-# whenever the projection shape or the internal-field set changes in a way a
-# fingerprint can't see.
+# in-memory LRUs), so validation includes a rules fingerprint that is a CONTENT
+# identity (sha256 of this module's + agent/redact.py's policy source bytes,
+# plus the schema version) — NOT a WebUI version stamp or pathname metadata.
+# Metadata equality does not imply byte equality, and a version stamp can be a
+# constant ('unknown'/None), so the fingerprint hashes the policy bytes that
+# actually shape the projection. Bump _REDACT_SESSION_CACHE_VERSION only when
+# the cache FILE format changes.
 #
 # This derived cache persists the redacted public projection of a session's
 # transcript lists on disk, keyed by per-message content digests. Loads splice
@@ -1321,26 +1324,67 @@ def redact_session_data(session_dict: dict) -> dict:
 _REDACT_SESSION_CACHE_VERSION = 1
 
 
-def _redact_session_cache_rules_key() -> str:
+def _redact_session_cache_rules_key() -> str | None:
     """Fingerprint of everything the cached projections depend on besides the
-    message content: the cache schema version, the WebUI version (projection
-    shape / internal-field set), and the agent redactor module file (credential
-    patterns can advance independently of the WebUI via the mounted checkout).
-    A mismatch forces a full recompute — this is the guard that keeps a stale
-    cache from serving credentials the CURRENT redactor would catch."""
+    message content: a manual schema version plus the CONTENT identity of every
+    implementation that shapes the projection — this module (the local fallback
+    redactor, sensitive markers, image exemption, and projection-field policy)
+    and the agent redactor module used to build ``_redact_fn_uncached``.
+
+    Identity is content (sha256 of the source bytes that define the policy), not
+    pathname metadata or a version stamp. Metadata equality does not imply byte
+    equality — distinct policy bytes can share ``mtime_ns``/``size``, and a WebUI
+    version stamp degrades to a constant (``'unknown'``/``None``) when git and
+    generated version files are unavailable. In that shape a policy change could
+    keep the whole key constant and let a stale projection serve text the
+    CURRENT redactor would remove. Hashing the policy source bytes is the
+    authoritative guard.
+
+    Returns ``None`` when no trustworthy identity can be computed (this module's
+    own source is unreadable); the caller treats ``None`` as "cannot authorize
+    reuse" and skips the persistent cache rather than accept a best-effort hint
+    at a hard safety boundary. When ``agent.redact`` is genuinely unimportable,
+    redaction falls back to THIS module's own patterns (already captured), so the
+    fixed ``absent`` marker is a real state, not a hidden change source. If the
+    agent redactor is importable but its policy source cannot be hashed
+    (zipimport/frozen build, ``None`` ``__file__``), ``None`` is returned too —
+    the live redactor is agent-backed, so the key must not stay constant.
+
+    Residual limitation: transitive modules/data imported by ``agent/redact.py``
+    are not hashed (hash the redactor plus any policy it imports for full
+    coverage; a generated build digest would be preferable). An incidental edit
+    to ``helpers.py`` invalidates every projection, which is conservative but
+    safe.
+    """
     import hashlib
     parts = [str(_REDACT_SESSION_CACHE_VERSION)]
     try:
-        from api.config import _current_webui_version
-        parts.append(str(_current_webui_version() or ""))
-    except Exception:
-        parts.append("")
+        with open(__file__, "rb") as fh:
+            parts.append(hashlib.sha256(fh.read()).hexdigest())
+    except OSError:
+        return None
     try:
         import agent.redact as _agent_redact
-        st = os.stat(_agent_redact.__file__)
-        parts.append(f"{st.st_mtime_ns}:{st.st_size}")
+    except ImportError:
+        # Genuinely absent (fallback-only mode): redaction depends solely on
+        # THIS module's own patterns, already captured above. A fixed marker is
+        # a real state, not a hidden change source.
+        parts.append("agent-redactor:absent")
     except Exception:
-        parts.append("")
+        # Cannot determine whether the agent-backed combined redactor is in
+        # play — fail closed rather than risk a constant key.
+        return None
+    else:
+        try:
+            with open(_agent_redact.__file__, "rb") as fh:
+                parts.append(hashlib.sha256(fh.read()).hexdigest())
+        except (OSError, TypeError, AttributeError):
+            # Importable but its policy source cannot be hashed (zipimport/frozen
+            # build, a None __file__, or a module with no __file__ attribute).
+            # Do NOT record "absent": _redact_fn_uncached is actually the
+            # agent-backed combined redactor, so an agent-side policy change
+            # could otherwise keep the key constant. Fail closed -> recompute.
+            return None
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
 
 
@@ -1404,7 +1448,12 @@ def redact_session_lists_cached(session_id, lists: dict, *, _active_turn_token=N
         rules_key = _redact_session_cache_rules_key()
         path = _redact_session_cache_path(session_id)
         cache = None
-        if path.exists():
+        # A valid rules_key is a HARD prerequisite for authorizing a cached read.
+        # If no trustworthy content identity could be computed (rules_key is
+        # None), do not even open the cache: rederive the projection from the
+        # current policy. This is the fail-closed branch the stale-redaction
+        # boundary requires — metadata/version identity is not content identity.
+        if rules_key is not None and path.exists():
             try:
                 loaded = _json.loads(path.read_text(encoding="utf-8"))
                 if (isinstance(loaded, dict)
@@ -1442,7 +1491,7 @@ def redact_session_lists_cached(session_id, lists: dict, *, _active_turn_token=N
             out[key] = projected
             if reused != len(digests):
                 wrote = True
-        if wrote and path is not None:
+        if wrote and path is not None and rules_key is not None:
             # Write DECORATION-FREE projections (must happen before the
             # response-only turn decoration below mutates `out`).
             payload = {

@@ -188,3 +188,94 @@ def test_delete_noop_on_missing_or_invalid(state_dir):
     # nothing escaped the cache dir
     assert list((state_dir / "redaction_cache").glob("*.json")) == []
     assert (state_dir / "escape.json").exists() is False
+
+
+def _install_fake_agent_redact(monkeypatch, tmp_path, body):
+    """Populate ``sys.modules['agent']`` / ``['agent.redact']`` so that
+    ``import agent.redact`` resolves to a module whose ``__file__`` points at a
+    file whose bytes are exactly ``body``. Returns that file path."""
+    import sys
+    import types
+    pkg_dir = tmp_path / "agent"
+    pkg_dir.mkdir(exist_ok=True)
+    (pkg_dir / "__init__.py").write_text("")
+    redact_path = pkg_dir / "redact.py"
+    redact_path.write_text(body)
+    pkg = types.ModuleType("agent")
+    pkg.__path__ = [str(pkg_dir)]
+    redact_mod = types.ModuleType("agent.redact")
+    redact_mod.__file__ = str(redact_path)
+    monkeypatch.setitem(sys.modules, "agent", pkg)
+    monkeypatch.setitem(sys.modules, "agent.redact", redact_mod)
+    return redact_path
+
+
+def _utime(path, mtime_ns):
+    import os
+    os.utime(path, ns=(mtime_ns, mtime_ns))
+
+
+def test_rules_key_is_content_identity_not_pathname_metadata(tmp_path, monkeypatch):
+    # Regression (#7414 review): the rules key must be a CONTENT identity, not
+    # pathname metadata. Two different policy byte-for-byte files that share
+    # size AND mtime_ns must produce DIFFERENT keys — otherwise a stale
+    # projection survives a redaction-policy change that happens to retain the
+    # same file size/mtime, serving text the CURRENT redactor would remove.
+    import os
+    body_a = "VALUE = 1\n"
+    body_b = "VALUE = 2\n"
+    assert len(body_a) == len(body_b)  # same size by construction
+    fixed_mtime = 1234567890123456789
+    redact_path = _install_fake_agent_redact(monkeypatch, tmp_path, body_a)
+
+    _utime(redact_path, fixed_mtime)
+    key_a = H._redact_session_cache_rules_key()
+
+    # Rewrite with different bytes, same size, same mtime_ns.
+    redact_path.write_text(body_b)
+    _utime(redact_path, fixed_mtime)
+    st = os.stat(redact_path)
+    assert st.st_mtime_ns == fixed_mtime
+    key_b = H._redact_session_cache_rules_key()
+
+    assert key_a != key_b, "content-identity key must change when policy bytes change"
+
+
+def test_rules_key_independent_of_webui_version_constant(monkeypatch):
+    # Regression (#7414 review): the WebUI version stamp must NOT be the
+    # authoritative identity — it degrades to a constant (None / 'unknown')
+    # when git and generated version files are unavailable. With the version
+    # removed from the identity, a constant version cannot collapse the key and
+    # hide a policy change; the key reflects policy content only.
+    import api.config as C
+    monkeypatch.setattr(C, "_current_webui_version", lambda: None)
+    k_none = H._redact_session_cache_rules_key()
+    monkeypatch.setattr(C, "_current_webui_version", lambda: "unknown")
+    k_unknown = H._redact_session_cache_rules_key()
+    monkeypatch.setattr(C, "_current_webui_version", lambda: "v0.52.264")
+    k_real = H._redact_session_cache_rules_key()
+
+    # Unchanged policy content => stable, deterministic key, independent of the
+    # (constant or real) version stamp.
+    assert k_none == k_unknown == k_real
+    # Deterministic across repeated calls (the "unchanged rule identity" control).
+    assert H._redact_session_cache_rules_key() == k_real
+
+
+def test_rules_key_none_fail_closed_recomputes(state_dir, monkeypatch):
+    # Regression (#7414 review): if no trustworthy content identity can be
+    # computed (rules_key is None), the persistent cache must be SKIPPED — not
+    # read-and-reused, and not freshly re-validated against an authorizable key.
+    msgs = _msgs()
+    redact_session_lists_cached("sessNone", {"messages": msgs})  # seed a valid cache
+    calls = _spy(monkeypatch)
+    monkeypatch.setattr(H, "_redact_session_cache_rules_key", lambda: None)
+
+    out = redact_session_lists_cached("sessNone", {"messages": msgs})
+
+    # Fail-closed: full recompute, nothing spliced from the seeded cache.
+    assert calls["n"] == len(msgs)
+    assert _SECRET_STATE_OK(out)
+    # A None identity must NOT be persisted as an authorizable cache key.
+    stored = json.loads((state_dir / "redaction_cache" / "sessNone.json").read_text())
+    assert stored["rules_key"] is not None
