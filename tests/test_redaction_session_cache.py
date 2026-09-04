@@ -190,76 +190,64 @@ def test_delete_noop_on_missing_or_invalid(state_dir):
     assert (state_dir / "escape.json").exists() is False
 
 
-def _install_fake_agent_redact(monkeypatch, tmp_path, body):
-    """Populate ``sys.modules['agent']`` / ``['agent.redact']`` so that
-    ``import agent.redact`` resolves to a module whose ``__file__`` points at a
-    file whose bytes are exactly ``body``. Returns that file path."""
-    import sys
-    import types
-    pkg_dir = tmp_path / "agent"
-    pkg_dir.mkdir(exist_ok=True)
-    (pkg_dir / "__init__.py").write_text("")
-    redact_path = pkg_dir / "redact.py"
-    redact_path.write_text(body)
-    pkg = types.ModuleType("agent")
-    pkg.__path__ = [str(pkg_dir)]
-    redact_mod = types.ModuleType("agent.redact")
-    redact_mod.__file__ = str(redact_path)
-    monkeypatch.setitem(sys.modules, "agent", pkg)
-    monkeypatch.setitem(sys.modules, "agent.redact", redact_mod)
-    return redact_path
-
-
 def _utime(path, mtime_ns):
     import os
     os.utime(path, ns=(mtime_ns, mtime_ns))
 
 
-def test_rules_key_is_content_identity_not_pathname_metadata(tmp_path, monkeypatch):
-    # Regression (#7414 review): the rules key must be a CONTENT identity, not
-    # pathname metadata. Two different policy byte-for-byte files that share
-    # size AND mtime_ns must produce DIFFERENT keys — otherwise a stale
+def test_rules_content_digest_not_pathname_metadata(tmp_path):
+    # Regression (#7414 review): a rules identity must be CONTENT, not pathname
+    # metadata. Two different policy byte-for-byte files that share size AND
+    # mtime_ns must produce DIFFERENT content digests — otherwise a stale
     # projection survives a redaction-policy change that happens to retain the
-    # same file size/mtime, serving text the CURRENT redactor would remove.
+    # same file size/mtime. We test the content-identity primitive directly:
+    # the rules key captures these digests once at import, so a mid-process
+    # file swap must NOT change the key (only a restart with new bytes does).
     import os
     body_a = "VALUE = 1\n"
     body_b = "VALUE = 2\n"
     assert len(body_a) == len(body_b)  # same size by construction
     fixed_mtime = 1234567890123456789
-    redact_path = _install_fake_agent_redact(monkeypatch, tmp_path, body_a)
-
-    _utime(redact_path, fixed_mtime)
-    key_a = H._redact_session_cache_rules_key()
-
+    path = tmp_path / "policy.py"
+    path.write_text(body_a)
+    _utime(path, fixed_mtime)
+    digest_a = H._content_digest(path)
+    assert digest_a is not None
     # Rewrite with different bytes, same size, same mtime_ns.
-    redact_path.write_text(body_b)
-    _utime(redact_path, fixed_mtime)
-    st = os.stat(redact_path)
-    assert st.st_mtime_ns == fixed_mtime
-    key_b = H._redact_session_cache_rules_key()
+    path.write_text(body_b)
+    _utime(path, fixed_mtime)
+    st_b = os.stat(path)
+    digest_b = H._content_digest(path)
+    assert digest_b is not None
+    assert H._content_digest(path) == digest_b  # deterministic
+    assert st_b.st_size == len(body_a)  # identical size
+    assert digest_a != digest_b, "content digest must change when policy bytes change"
 
-    assert key_a != key_b, "content-identity key must change when policy bytes change"
+
+def test_rules_key_captured_at_import_matches_module_digest():
+    # The rules key's content digests are captured ONCE at import, so they match
+    # this module's actual source bytes (the policy that was loaded, not the
+    # on-disk bytes at call time — the TOCTOU fix).
+    assert H._REDACT_RULES_HELPERS_DIGEST == H._content_digest(H.__file__)
+    assert H._REDACT_RULES_HELPERS_DIGEST is not None
+    assert H._redact_session_cache_rules_key() is not None
 
 
-def test_rules_key_independent_of_webui_version_constant(monkeypatch):
-    # Regression (#7414 review): the WebUI version stamp must NOT be the
-    # authoritative identity — it degrades to a constant (None / 'unknown')
-    # when git and generated version files are unavailable. With the version
-    # removed from the identity, a constant version cannot collapse the key and
-    # hide a policy change; the key reflects policy content only.
+def test_rules_key_is_stable_per_process(monkeypatch):
+    # The rules key is frozen at import (matching the loaded policy), so it must
+    # be stable across calls and independent of the WebUI version stamp (which
+    # was removed from the identity — a constant 'unknown'/None can't collapse
+    # the key). This is the "unchanged rule identity -> zero-work" control.
+    k1 = H._redact_session_cache_rules_key()
+    assert k1 is not None
+    assert H._redact_session_cache_rules_key() == k1
     import api.config as C
     monkeypatch.setattr(C, "_current_webui_version", lambda: None)
-    k_none = H._redact_session_cache_rules_key()
+    assert H._redact_session_cache_rules_key() == k1
     monkeypatch.setattr(C, "_current_webui_version", lambda: "unknown")
-    k_unknown = H._redact_session_cache_rules_key()
+    assert H._redact_session_cache_rules_key() == k1
     monkeypatch.setattr(C, "_current_webui_version", lambda: "v0.52.264")
-    k_real = H._redact_session_cache_rules_key()
-
-    # Unchanged policy content => stable, deterministic key, independent of the
-    # (constant or real) version stamp.
-    assert k_none == k_unknown == k_real
-    # Deterministic across repeated calls (the "unchanged rule identity" control).
-    assert H._redact_session_cache_rules_key() == k_real
+    assert H._redact_session_cache_rules_key() == k1
 
 
 def test_rules_key_none_fail_closed_recomputes(state_dir, monkeypatch):

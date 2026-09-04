@@ -461,6 +461,38 @@ def _build_redact_fn():
 _redact_fn_uncached = _build_redact_fn()
 
 
+def _content_digest(path) -> str | None:
+    """sha256 of a file's bytes — a CONTENT identity, not metadata. Returns
+    ``None`` when ``path`` is unreadable so callers can fail closed."""
+    import hashlib
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except (OSError, TypeError):
+        return None
+
+
+# Capture the rules CONTENT identity ONCE at import. The redactor
+# (`_redact_fn_uncached`) is frozen at import time; re-hashing on-disk bytes on
+# every cache-key call (as the previous implementation did) can diverge from the
+# in-force policy after a mid-process edit to helpers.py / agent.redact, so a
+# stale projection could be re-stamped with the new on-disk key and served after
+# restart (TOCTOU). Reading the bytes actually imported here ties the key to the
+# policy in force for this process; a real policy change is recognized only
+# across a restart, when these are recomputed from the new bytes.
+_REDACT_RULES_HELPERS_DIGEST = _content_digest(__file__)
+_REDACT_RULES_AGENT_ABSENT = False
+_REDACT_RULES_AGENT_DIGEST = None
+try:
+    import agent.redact as _rules_agent_redact
+    _REDACT_RULES_AGENT_DIGEST = _content_digest(_rules_agent_redact.__file__)
+except ImportError:
+    _REDACT_RULES_AGENT_ABSENT = True
+except Exception:
+    # Indeterminate -> the key function fails closed (agent digest stays None).
+    _REDACT_RULES_AGENT_DIGEST = None
+
+
 # Sanity ceiling on the memo cache capacities so a fat-fingered env value
 # can't silently 10x the worst-case RSS (the very thing the env knobs exist to
 # bound). Above all defaults (16384/16384/256); below any plausible typo scale.
@@ -1365,60 +1397,45 @@ def _redact_session_cache_rules_key() -> str | None:
     redactor, sensitive markers, image exemption, and projection-field policy)
     and the agent redactor module used to build ``_redact_fn_uncached``.
 
-    Identity is content (sha256 of the source bytes that define the policy), not
-    pathname metadata or a version stamp. Metadata equality does not imply byte
-    equality — distinct policy bytes can share ``mtime_ns``/``size``, and a WebUI
-    version stamp degrades to a constant (``'unknown'``/``None``) when git and
-    generated version files are unavailable. In that shape a policy change could
-    keep the whole key constant and let a stale projection serve text the
-    CURRENT redactor would remove. Hashing the policy source bytes is the
-    authoritative guard.
+    Identity is content (sha256 of the policy source bytes), not pathname
+    metadata or a version stamp. Metadata equality does not imply byte equality
+    — distinct policy bytes can share ``mtime_ns``/``size``, and a WebUI version
+    stamp degrades to a constant (``'unknown'``/``None``) when git and generated
+    version files are unavailable. Hashing policy source bytes is the guard that
+    keeps a stale projection from serving text the CURRENT redactor would remove.
 
-    Returns ``None`` when no trustworthy identity can be computed (this module's
-    own source is unreadable); the caller treats ``None`` as "cannot authorize
-    reuse" and skips the persistent cache rather than accept a best-effort hint
-    at a hard safety boundary. When ``agent.redact`` is genuinely unimportable,
-    redaction falls back to THIS module's own patterns (already captured), so the
-    fixed ``absent`` marker is a real state, not a hidden change source. If the
-    agent redactor is importable but its policy source cannot be hashed
-    (zipimport/frozen build, ``None`` ``__file__``), ``None`` is returned too —
-    the live redactor is agent-backed, so the key must not stay constant.
+    The digests are captured ONCE at import (``_REDACT_RULES_*``) because the
+    redactor is frozen at import: re-reading on-disk bytes on every call would
+    mismatch the in-force policy after a mid-process edit, letting a stale
+    projection be re-stamped with the new key and served after restart (TOCTOU).
+
+    Returns ``None`` when no trustworthy identity can be computed, so the caller
+    skips the persistent cache rather than accept a best-effort hint at a hard
+    safety boundary. ``None`` results when this module's own source is
+    unreadable, or when ``agent.redact`` is importable but its source cannot be
+    hashed (zipimport/frozen build, ``None`` ``__file__``) — in that state
+    ``_redact_fn_uncached`` is the agent-backed combined redactor, so the key
+    must not stay constant. When ``agent.redact`` is genuinely unimportable,
+    redaction falls back to THIS module's own patterns (already captured), so
+    the fixed ``absent`` marker is a real state, not a hidden change source.
 
     Residual limitation: transitive modules/data imported by ``agent/redact.py``
-    are not hashed (hash the redactor plus any policy it imports for full
-    coverage; a generated build digest would be preferable). An incidental edit
-    to ``helpers.py`` invalidates every projection, which is conservative but
-    safe.
+    are not hashed (a generated build digest would cover those). A real policy
+    change is recognized at process start (when these digests are recomputed),
+    so a restart with a new redactor invalidates stale projections.
     """
     import hashlib
-    parts = [str(_REDACT_SESSION_CACHE_VERSION)]
-    try:
-        with open(__file__, "rb") as fh:
-            parts.append(hashlib.sha256(fh.read()).hexdigest())
-    except OSError:
+    if _REDACT_RULES_HELPERS_DIGEST is None:
         return None
-    try:
-        import agent.redact as _agent_redact
-    except ImportError:
-        # Genuinely absent (fallback-only mode): redaction depends solely on
-        # THIS module's own patterns, already captured above. A fixed marker is
-        # a real state, not a hidden change source.
+    parts = [str(_REDACT_SESSION_CACHE_VERSION), _REDACT_RULES_HELPERS_DIGEST]
+    if _REDACT_RULES_AGENT_ABSENT:
         parts.append("agent-redactor:absent")
-    except Exception:
-        # Cannot determine whether the agent-backed combined redactor is in
-        # play — fail closed rather than risk a constant key.
-        return None
+    elif _REDACT_RULES_AGENT_DIGEST is not None:
+        parts.append(_REDACT_RULES_AGENT_DIGEST)
     else:
-        try:
-            with open(_agent_redact.__file__, "rb") as fh:
-                parts.append(hashlib.sha256(fh.read()).hexdigest())
-        except (OSError, TypeError, AttributeError):
-            # Importable but its policy source cannot be hashed (zipimport/frozen
-            # build, a None __file__, or a module with no __file__ attribute).
-            # Do NOT record "absent": _redact_fn_uncached is actually the
-            # agent-backed combined redactor, so an agent-side policy change
-            # could otherwise keep the key constant. Fail closed -> recompute.
-            return None
+        # Agent importable but its source is unhashable (see docstring) — no
+        # trustworthy identity; fail closed.
+        return None
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
 
 
