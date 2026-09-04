@@ -1561,19 +1561,32 @@ def redact_session_lists_cached(session_id, lists: dict, *, _active_turn_token=N
 
 
 def delete_redaction_session_cache(session_id) -> bool:
-    """Remove the persisted redaction projection for ``session_id``.
+    """Remove the persisted redaction projection for ``session_id`` and drop the
+    deleted session's strings from the process-wide redaction memos.
 
     Hooked into the session-deletion paths so a deleted conversation is not
     recoverable from ``STATE_DIR/redaction_cache/`` (same rationale as #3802
     for the turn/run journals: the file holds redacted projections, but the
     surviving conversation text still belongs to the deleted session).
-    Unsafe ids and a missing file are a no-op; returns True only if a file
-    was actually removed. Best-effort — never raises.
+
+    The in-memory decision/redactor LRUs key on the ORIGINAL string, so a
+    deleted session's plaintext (including any secrets) would otherwise be held
+    until LRU eviction. Clearing them here extends the same deletion contract to
+    RAM. ``lru_cache`` has no per-key eviction, so the whole memo is cleared —
+    cheap, and only ever reached on a real deletion path. Unsafe ids and a
+    missing projection file are a no-op for the on-disk artifact; returns True
+    only if a file was actually removed. Best-effort — never raises.
     """
     try:
         path = _redact_session_cache_path(session_id)
     except Exception:
         return False
+    try:
+        _redact_fn_lru.cache_clear()
+        _redact_text_lru.cache_clear()
+        _redact_text_big_lru.cache_clear()
+    except Exception:
+        pass
     try:
         if not path.exists():
             return False

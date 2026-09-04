@@ -279,3 +279,24 @@ def test_rules_key_none_fail_closed_recomputes(state_dir, monkeypatch):
     # A None identity must NOT be persisted as an authorizable cache key.
     stored = json.loads((state_dir / "redaction_cache" / "sessNone.json").read_text())
     assert stored["rules_key"] is not None
+
+
+def test_delete_clears_in_memory_redaction_memos(state_dir):
+    # The in-memory decision/redactor LRUs key on ORIGINAL strings (including
+    # plaintext secrets) and are retained process-wide; deleting a session must
+    # drop them from RAM, not just the on-disk projection (#7414 review follow-up
+    # on the adversarial review's secret-retention finding).
+    secret = "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    H._redact_text_lru.cache_clear()
+    H._redact_fn_lru.cache_clear()
+    H._redact_text_big_lru.cache_clear()
+    sample = f"delete me and my secret {secret} must not linger"
+    out = H._redact_text(sample, _enabled=True)
+    assert secret not in out
+    assert H._redact_text_lru.cache_info().currsize >= 1
+    assert H._redact_fn_lru.cache_info().currsize >= 1
+    # Deleting a valid session (even with no projection file) clears the memos.
+    assert delete_redaction_session_cache("sessRam") is False  # no on-disk file
+    assert H._redact_text_lru.cache_info().currsize == 0
+    assert H._redact_fn_lru.cache_info().currsize == 0
+    assert H._redact_text_big_lru.cache_info().currsize == 0
