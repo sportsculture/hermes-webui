@@ -62,24 +62,27 @@ def test_redact_text_giant_above_ceiling_not_memoized():
 
 
 def test_redact_memo_caps_defaulted_and_env_tunable(monkeypatch):
-    # The process-wide memos are bounded by LRU maxsize (memory cannot grow
-    # unboundedly), and the shipped defaults are conservative enough that the
-    # worst-case RSS stays bounded (greptile P1). Env vars can raise/lower them.
+    # The process-wide memos are bounded by LRU maxsize PER TIER (memory cannot
+    # grow unboundedly), and the shipped defaults are conservative (greptile P1).
+    # Env vars can raise/lower them, but each tier is clamped to its byte budget.
     assert H._redact_fn_lru.cache_info().maxsize == 16384
     assert H._redact_text_lru.cache_info().maxsize == 16384
     assert H._redact_text_big_lru.cache_info().maxsize == 256
 
-    # _lru_size: positive int from env, else the default.
-    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING") == 100
+    # _lru_size: positive int from env, clamped to `cap`, else the default.
+    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING", 200) == 100
     monkeypatch.setenv("PI_TEST_REDACT_MEMO_MISSING", "5")
-    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING") == 5
+    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING", 200) == 5
     monkeypatch.setenv("PI_TEST_REDACT_MEMO_MISSING", "0")
-    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING") == 100  # <1 rejected
+    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING", 200) == 100  # <1 rejected
     monkeypatch.setenv("PI_TEST_REDACT_MEMO_MISSING", "not-a-number")
-    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING") == 100  # invalid rejected
-    # A fat-fingered huge value is clamped so it can't balloon RSS.
+    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING", 200) == 100  # invalid rejected
+    # A fat-fingered huge value is clamped to the per-tier cap (greptile P1: the
+    # big tier must not allow 131072 * 256KiB ≈ 32GiB).
     monkeypatch.setenv("PI_TEST_REDACT_MEMO_MISSING", "999999999")
-    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING") == H._REDACT_MEMO_MAX_CAP
-    assert H._REDACT_MEMO_MAX_CAP >= H._redact_fn_lru.cache_info().maxsize
-    assert H._REDACT_MEMO_MAX_CAP >= H._redact_text_lru.cache_info().maxsize
-    assert H._REDACT_MEMO_MAX_CAP >= H._redact_text_big_lru.cache_info().maxsize
+    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING", 200) == 200
+    # Big-tier ceiling is byte-budget derived and far below a shared-count cap.
+    assert H._REDACT_BIG_TIER_CAP < 131072
+    assert H._redact_text_big_lru.cache_info().maxsize <= H._REDACT_BIG_TIER_CAP
+    assert H._REDACT_SMALL_TIER_CAP == H._REDACT_MEMO_BYTE_BUDGET // (2 * H._REDACT_MEMO_SMALL_ENTRY)
+    assert H._REDACT_BIG_TIER_CAP == H._REDACT_MEMO_BYTE_BUDGET // (2 * H._REDACT_MEMO_BIG_ENTRY)

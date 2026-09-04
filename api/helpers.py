@@ -493,27 +493,35 @@ except Exception:
     _REDACT_RULES_AGENT_DIGEST = None
 
 
-# Sanity ceiling on the memo cache capacities so a fat-fingered env value
-# can't silently 10x the worst-case RSS (the very thing the env knobs exist to
-# bound). Above all defaults (16384/16384/256); below any plausible typo scale.
-_REDACT_MEMO_MAX_CAP = 131072
+# Per-tier entry ceilings so a raised env knob can't exceed a bounded byte
+# footprint. A SHARED count cap would let the 256KiB big tier retain ~32GiB at a
+# 131072-entry ceiling while the 16KiB small tiers hold a fraction of that
+# (greptile P1). Each cap is derived from a 1GiB-per-tier byte budget (keys+
+# values), so small tiers (16KiB) cap at 32768 and the big tier (256KiB) at
+# 2048. Defaults (16384/16384/256) sit below these; env knobs stay tunable but
+# never balloon.
+_REDACT_MEMO_BYTE_BUDGET = 1024 * 1024 * 1024  # 1 GiB per tier (keys+values)
+_REDACT_MEMO_SMALL_ENTRY = 16384               # == _REDACT_CACHE_MAX_TEXT_LEN
+_REDACT_MEMO_BIG_ENTRY = 262144                # == _REDACT_TEXT_BIG_CACHE_MAX
+_REDACT_SMALL_TIER_CAP = _REDACT_MEMO_BYTE_BUDGET // (2 * _REDACT_MEMO_SMALL_ENTRY)
+_REDACT_BIG_TIER_CAP = _REDACT_MEMO_BYTE_BUDGET // (2 * _REDACT_MEMO_BIG_ENTRY)
 
 
-def _lru_size(default: int, env: str) -> int:
-    """Return a positive LRU ``maxsize``, overridable via env var ``env``.
+def _lru_size(default: int, env: str, cap: int) -> int:
+    """Return a positive LRU ``maxsize``, overridable via env var ``env`` and
+    clamped to ``cap`` (the tier's byte-budget-derived ceiling).
 
     The redaction/decision memos are process-wide and retained across sessions
     (deliberate: the perf win is that repeat loads skip re-scanning and
     re-redacting). Each is bounded by its LRU ``maxsize``; the shipped defaults
-    are conservative enough to keep the worst-case RSS bounded, and are exposed
-    as env knobs (``HERMES_WEBUI_REDACT_*``) so a host can raise them if it has
-    headroom or lower them further on a tight box. Values are clamped to
-    ``_REDACT_MEMO_MAX_CAP`` so an errant entry can't balloon.
+    are conservative, and the caps are exposed as env knobs
+    (``HERMES_WEBUI_REDACT_*``) so a host can tune them. ``cap`` keeps an errant
+    entry from ballooning past the tier's RSS budget.
     """
     try:
         val = int(os.getenv(env, default))
         if val >= 1:
-            return min(val, _REDACT_MEMO_MAX_CAP)
+            return min(val, cap)
     except (TypeError, ValueError):
         pass
     return default
@@ -526,7 +534,7 @@ def _lru_size(default: int, env: str) -> int:
 # deterministic (force=True, fixed masking), so identical strings always map to
 # identical output and are safe to memoize without invalidation.
 _redact_fn_lru = functools.lru_cache(
-    maxsize=_lru_size(16384, "HERMES_WEBUI_REDACT_FN_MEMO")
+    maxsize=_lru_size(16384, "HERMES_WEBUI_REDACT_FN_MEMO", _REDACT_SMALL_TIER_CAP)
 )(_redact_fn_uncached)
 
 # Cap per-entry size so a handful of giant tool-output dumps can't evict the
@@ -554,7 +562,7 @@ def _redact_fn_cached(text):
 # ~1.1GB theoretical ceiling. Realistic occupancy is far lower (clean strings
 # alias their key objects, most transcript strings are short), and strings above
 # the caps bypass the cache entirely. All three capacities are tunable via
-# HERMES_WEBUI_REDACT_* env vars, and clamped to _REDACT_MEMO_MAX_CAP.
+# HERMES_WEBUI_REDACT_* env vars, each clamped to a per-tier byte-budget cap.
 def _redact_text_impl(text: str) -> str:
     if not _might_contain_sensitive_text(text):
         return text
@@ -562,10 +570,10 @@ def _redact_text_impl(text: str) -> str:
 
 
 _redact_text_lru = functools.lru_cache(
-    maxsize=_lru_size(16384, "HERMES_WEBUI_REDACT_DECISION_MEMO")
+    maxsize=_lru_size(16384, "HERMES_WEBUI_REDACT_DECISION_MEMO", _REDACT_SMALL_TIER_CAP)
 )(_redact_text_impl)
 _redact_text_big_lru = functools.lru_cache(
-    maxsize=_lru_size(256, "HERMES_WEBUI_REDACT_BIG_DECISION_MEMO")
+    maxsize=_lru_size(256, "HERMES_WEBUI_REDACT_BIG_DECISION_MEMO", _REDACT_BIG_TIER_CAP)
 )(_redact_text_impl)
 _REDACT_TEXT_BIG_CACHE_MAX = 262144
 
