@@ -63,11 +63,11 @@ def test_redact_text_giant_above_ceiling_not_memoized():
 
 def test_redact_memo_caps_defaulted_and_env_tunable(monkeypatch):
     # The process-wide memos are bounded by LRU maxsize (memory cannot grow
-    # unboundedly), and the caps are overridable via env for constrained hosts.
-    # Defaults are unchanged from the intended perf tuning.
-    assert H._redact_fn_lru.cache_info().maxsize == 32768
-    assert H._redact_text_lru.cache_info().maxsize == 32768
-    assert H._redact_text_big_lru.cache_info().maxsize == 1024
+    # unboundedly), and the shipped defaults are conservative enough that the
+    # worst-case RSS stays bounded (greptile P1). Env vars can raise/lower them.
+    assert H._redact_fn_lru.cache_info().maxsize == 16384
+    assert H._redact_text_lru.cache_info().maxsize == 16384
+    assert H._redact_text_big_lru.cache_info().maxsize == 256
 
     # _lru_size: positive int from env, else the default.
     assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING") == 100
@@ -77,3 +77,9 @@ def test_redact_memo_caps_defaulted_and_env_tunable(monkeypatch):
     assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING") == 100  # <1 rejected
     monkeypatch.setenv("PI_TEST_REDACT_MEMO_MISSING", "not-a-number")
     assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING") == 100  # invalid rejected
+    # A fat-fingered huge value is clamped so it can't balloon RSS.
+    monkeypatch.setenv("PI_TEST_REDACT_MEMO_MISSING", "999999999")
+    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING") == H._REDACT_MEMO_MAX_CAP
+    assert H._REDACT_MEMO_MAX_CAP >= H._redact_fn_lru.cache_info().maxsize
+    assert H._REDACT_MEMO_MAX_CAP >= H._redact_text_lru.cache_info().maxsize
+    assert H._REDACT_MEMO_MAX_CAP >= H._redact_text_big_lru.cache_info().maxsize

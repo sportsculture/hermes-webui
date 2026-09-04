@@ -461,20 +461,27 @@ def _build_redact_fn():
 _redact_fn_uncached = _build_redact_fn()
 
 
+# Sanity ceiling on the memo cache capacities so a fat-fingered env value
+# can't silently 10x the worst-case RSS (the very thing the env knobs exist to
+# bound). Above all defaults (16384/16384/256); below any plausible typo scale.
+_REDACT_MEMO_MAX_CAP = 131072
+
+
 def _lru_size(default: int, env: str) -> int:
     """Return a positive LRU ``maxsize``, overridable via env var ``env``.
 
     The redaction/decision memos are process-wide and retained across sessions
     (deliberate: the perf win is that repeat loads skip re-scanning and
-    re-redacting). Each is bounded by its LRU ``maxsize``, but on a
-    memory-constrained host the worst-case RSS across the three tiers can still
-    be large, so the capacities are exposed as env knobs (defaults unchanged) —
-    set them low to cap growth without giving up the default fast path.
+    re-redacting). Each is bounded by its LRU ``maxsize``; the shipped defaults
+    are conservative enough to keep the worst-case RSS bounded, and are exposed
+    as env knobs (``HERMES_WEBUI_REDACT_*``) so a host can raise them if it has
+    headroom or lower them further on a tight box. Values are clamped to
+    ``_REDACT_MEMO_MAX_CAP`` so an errant entry can't balloon.
     """
     try:
         val = int(os.getenv(env, default))
         if val >= 1:
-            return val
+            return min(val, _REDACT_MEMO_MAX_CAP)
     except (TypeError, ValueError):
         pass
     return default
@@ -487,7 +494,7 @@ def _lru_size(default: int, env: str) -> int:
 # deterministic (force=True, fixed masking), so identical strings always map to
 # identical output and are safe to memoize without invalidation.
 _redact_fn_lru = functools.lru_cache(
-    maxsize=_lru_size(32768, "HERMES_WEBUI_REDACT_FN_MEMO")
+    maxsize=_lru_size(16384, "HERMES_WEBUI_REDACT_FN_MEMO")
 )(_redact_fn_uncached)
 
 # Cap per-entry size so a handful of giant tool-output dumps can't evict the
@@ -509,13 +516,13 @@ def _redact_fn_cached(text):
 # DECISION is memoized here: warm passes become dict lookups, and CPython
 # caches str hashes on the string objects themselves, so sessions held in the
 # compact-session LRU skip even the hash cost. Two tiers mirror the redactor
-# memo: small (≤16KiB, 32768 entries) and big (≤256KiB, 1024 entries).
-# Worst-case tier RSS (keys+values at the caps): big tier 1024·256KiB ≈ 512MB,
-# small decision tier 32768·16KiB ≈ 1GB, redactor memo 32768·16KiB ≈ 1GB — a
-# ~2.5GB theoretical ceiling. Realistic occupancy is far lower (clean strings
+# memo: small (≤16KiB, 16384 entries) and big (≤256KiB, 256 entries).
+# Worst-case tier RSS (keys+values at the caps): big tier 256·256KiB ≈ 128MB,
+# small decision tier 16384·16KiB ≈ 512MB, redactor memo 16384·16KiB ≈ 512MB — a
+# ~1.1GB theoretical ceiling. Realistic occupancy is far lower (clean strings
 # alias their key objects, most transcript strings are short), and strings above
 # the caps bypass the cache entirely. All three capacities are tunable via
-# HERMES_WEBUI_REDACT_* env vars for memory-constrained hosts.
+# HERMES_WEBUI_REDACT_* env vars, and clamped to _REDACT_MEMO_MAX_CAP.
 def _redact_text_impl(text: str) -> str:
     if not _might_contain_sensitive_text(text):
         return text
@@ -523,10 +530,10 @@ def _redact_text_impl(text: str) -> str:
 
 
 _redact_text_lru = functools.lru_cache(
-    maxsize=_lru_size(32768, "HERMES_WEBUI_REDACT_DECISION_MEMO")
+    maxsize=_lru_size(16384, "HERMES_WEBUI_REDACT_DECISION_MEMO")
 )(_redact_text_impl)
 _redact_text_big_lru = functools.lru_cache(
-    maxsize=_lru_size(1024, "HERMES_WEBUI_REDACT_BIG_DECISION_MEMO")
+    maxsize=_lru_size(256, "HERMES_WEBUI_REDACT_BIG_DECISION_MEMO")
 )(_redact_text_impl)
 _REDACT_TEXT_BIG_CACHE_MAX = 262144
 
