@@ -59,3 +59,21 @@ def test_redact_text_giant_above_ceiling_not_memoized():
     out = H._redact_text(giant, _enabled=True)
     assert _SECRET not in out
     assert H._redact_text_big_lru.cache_info().misses == before  # tier skipped
+
+
+def test_redact_memo_caps_defaulted_and_env_tunable(monkeypatch):
+    # The process-wide memos are bounded by LRU maxsize (memory cannot grow
+    # unboundedly), and the caps are overridable via env for constrained hosts.
+    # Defaults are unchanged from the intended perf tuning.
+    assert H._redact_fn_lru.cache_info().maxsize == 32768
+    assert H._redact_text_lru.cache_info().maxsize == 32768
+    assert H._redact_text_big_lru.cache_info().maxsize == 1024
+
+    # _lru_size: positive int from env, else the default.
+    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING") == 100
+    monkeypatch.setenv("PI_TEST_REDACT_MEMO_MISSING", "5")
+    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING") == 5
+    monkeypatch.setenv("PI_TEST_REDACT_MEMO_MISSING", "0")
+    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING") == 100  # <1 rejected
+    monkeypatch.setenv("PI_TEST_REDACT_MEMO_MISSING", "not-a-number")
+    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING") == 100  # invalid rejected

@@ -460,13 +460,35 @@ def _build_redact_fn():
 
 _redact_fn_uncached = _build_redact_fn()
 
+
+def _lru_size(default: int, env: str) -> int:
+    """Return a positive LRU ``maxsize``, overridable via env var ``env``.
+
+    The redaction/decision memos are process-wide and retained across sessions
+    (deliberate: the perf win is that repeat loads skip re-scanning and
+    re-redacting). Each is bounded by its LRU ``maxsize``, but on a
+    memory-constrained host the worst-case RSS across the three tiers can still
+    be large, so the capacities are exposed as env knobs (defaults unchanged) —
+    set them low to cap growth without giving up the default fast path.
+    """
+    try:
+        val = int(os.getenv(env, default))
+        if val >= 1:
+            return val
+    except (TypeError, ValueError):
+        pass
+    return default
+
+
 # Repeated dashboard polls re-request the same unchanged session payloads, so
 # the combined redactor (~15 regex passes per string) was the dominant CPU cost
 # under concurrent polling — enough to wedge the single-process server behind
 # the GIL and surface as "Mất kết nối" in the browser. The redactor is pure and
 # deterministic (force=True, fixed masking), so identical strings always map to
 # identical output and are safe to memoize without invalidation.
-_redact_fn_lru = functools.lru_cache(maxsize=32768)(_redact_fn_uncached)
+_redact_fn_lru = functools.lru_cache(
+    maxsize=_lru_size(32768, "HERMES_WEBUI_REDACT_FN_MEMO")
+)(_redact_fn_uncached)
 
 # Cap per-entry size so a handful of giant tool-output dumps can't evict the
 # thousands of small recurring strings that actually benefit, or balloon RSS.
@@ -488,19 +510,24 @@ def _redact_fn_cached(text):
 # caches str hashes on the string objects themselves, so sessions held in the
 # compact-session LRU skip even the hash cost. Two tiers mirror the redactor
 # memo: small (≤16KiB, 32768 entries) and big (≤256KiB, 1024 entries).
-# Worst-case tier RSS: big tier stores keys+values ≈ 512MB, small tier
-# ≈ 512MB, redactor memo ≈ 64MB — ~1GB theoretical ceiling; realistic
-# occupancy is tens of MB (clean strings alias their key objects, and
-# recurring short strings dominate). Strings above the big
-# ceiling stay uncached (rare giant dumps).
+# Worst-case tier RSS (keys+values at the caps): big tier 1024·256KiB ≈ 512MB,
+# small decision tier 32768·16KiB ≈ 1GB, redactor memo 32768·16KiB ≈ 1GB — a
+# ~2.5GB theoretical ceiling. Realistic occupancy is far lower (clean strings
+# alias their key objects, most transcript strings are short), and strings above
+# the caps bypass the cache entirely. All three capacities are tunable via
+# HERMES_WEBUI_REDACT_* env vars for memory-constrained hosts.
 def _redact_text_impl(text: str) -> str:
     if not _might_contain_sensitive_text(text):
         return text
     return _redact_fn_cached(text)
 
 
-_redact_text_lru = functools.lru_cache(maxsize=32768)(_redact_text_impl)
-_redact_text_big_lru = functools.lru_cache(maxsize=1024)(_redact_text_impl)
+_redact_text_lru = functools.lru_cache(
+    maxsize=_lru_size(32768, "HERMES_WEBUI_REDACT_DECISION_MEMO")
+)(_redact_text_impl)
+_redact_text_big_lru = functools.lru_cache(
+    maxsize=_lru_size(1024, "HERMES_WEBUI_REDACT_BIG_DECISION_MEMO")
+)(_redact_text_impl)
 _REDACT_TEXT_BIG_CACHE_MAX = 262144
 
 
