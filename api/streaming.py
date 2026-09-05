@@ -12953,7 +12953,9 @@ def _handle_chat_steer(handler, body: dict) -> bool:
                     with _cfg.ACTIVE_RUNS_LOCK:
                         active_run = dict((_cfg.ACTIVE_RUNS or {}).get(str(active_stream_id)) or {})
                     if active_run.get("backend") == "gateway":
-                        return j(handler, {"accepted": False, "fallback": "gateway_steer_queued",
+                        from api.gateway_chat import gateway_steer_run
+                        accepted, reason = gateway_steer_run(str(active_stream_id), text)
+                        return j(handler, {"accepted": accepted, "fallback": reason,
                                            "stream_id": active_stream_id})
                 except Exception:
                     logger.warning(

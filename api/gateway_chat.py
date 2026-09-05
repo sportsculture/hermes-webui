@@ -147,6 +147,48 @@ def wait_for_gateway_run_id(stream_id: str, timeout: float) -> tuple[bool, str |
                 if _retire_gateway_run_starting_if_done(stream_id):
                     _STREAM_RUN_STARTING_CONDITION.notify_all()
 
+
+def gateway_steer_run(stream_id: str, text: str):
+    """Relay a /steer payload to the active gateway run for ``stream_id``.
+
+    Gateway-mode turns run in the gateway process, so there is no local
+    AIAgent to steer. POST the guidance to the gateway's runs API
+    (POST /v1/runs/{run_id}/steer), which applies it at the next tool-result
+    boundary exactly like an in-process agent.steer(). Returns ``(ok, reason)``
+    where ``reason`` is None on success or a stable fallback key for the UI.
+    """
+    try:
+        run_id = str((_STREAM_RUN_IDS or {}).get(stream_id) or "").strip()
+    except Exception:
+        run_id = ""
+    if not run_id:
+        return False, "gateway_steer_no_run_id"
+    try:
+        import json as _json
+        import urllib.error as _urllib_error
+        import urllib.request as _urllib_request
+
+        url = f"{_gateway_base_url().rstrip('/')}/v1/runs/{run_id}/steer"
+        req = _urllib_request.Request(
+            url,
+            data=_json.dumps({"text": str(text or "")}).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {_gateway_api_key()}",
+            },
+            method="POST",
+        )
+        with _urllib_request.urlopen(req, timeout=15) as resp:
+            resp.read()
+        return True, None
+    except _urllib_error.HTTPError as e:
+        if e.code == 409:
+            return False, "gateway_steer_not_accepting"
+        return False, f"gateway_steer_http_{e.code}"
+    except Exception:
+        return False, "gateway_steer_error"
+
+
 _WEBUI_CHAT_BACKEND_ENV = "HERMES_WEBUI_CHAT_BACKEND"
 _WEBUI_GATEWAY_BASE_URL_ENV = "HERMES_WEBUI_GATEWAY_BASE_URL"
 _WEBUI_GATEWAY_API_KEY_ENV = "HERMES_WEBUI_GATEWAY_API_KEY"
@@ -626,6 +668,14 @@ def _run_gateway_runs_api_streaming(
             **body_extras,
             "session_id": session_id,
         }
+        # C1: propagate the webui session's workspace so gateway tool execution
+        # runs in the SAME directory the browser shows (the runs path otherwise
+        # falls back to the gateway's $HOME, so file/tool turns write to the
+        # wrong place). Only send paths under the shared workspace root; a raw
+        # sidecar path outside /workspace must not steer the gateway's cwd.
+        run_workspace = str(workspace or "").strip()
+        if run_workspace.startswith("/workspace"):
+            run_body["workspace"] = run_workspace
         if instructions_parts:
             run_body["instructions"] = "\n\n".join(part for part in instructions_parts if part)
         if conversation_history:
