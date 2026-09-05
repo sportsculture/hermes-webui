@@ -81,8 +81,11 @@ def test_redact_memo_caps_defaulted_and_env_tunable(monkeypatch):
     # big tier must not allow 131072 * 256KiB ≈ 32GiB).
     monkeypatch.setenv("PI_TEST_REDACT_MEMO_MISSING", "999999999")
     assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING", 200) == 200
-    # Big-tier ceiling is byte-budget derived and far below a shared-count cap.
+    # Big-tier ceiling is byte-budget derived from the REAL per-entry caps and
+    # far below a shared-count cap (greptile P1). This is not tautological: the
+    # caps are derived from _REDACT_CACHE_MAX_TEXT_LEN / _REDACT_TEXT_BIG_CACHE_MAX
+    # (the values the caches actually enforce), so if those drift the assertion fails.
     assert H._REDACT_BIG_TIER_CAP < 131072
     assert H._redact_text_big_lru.cache_info().maxsize <= H._REDACT_BIG_TIER_CAP
-    assert H._REDACT_SMALL_TIER_CAP == H._REDACT_MEMO_BYTE_BUDGET // (2 * H._REDACT_MEMO_SMALL_ENTRY)
-    assert H._REDACT_BIG_TIER_CAP == H._REDACT_MEMO_BYTE_BUDGET // (2 * H._REDACT_MEMO_BIG_ENTRY)
+    assert H._REDACT_SMALL_TIER_CAP == H._REDACT_MEMO_BYTE_BUDGET // (2 * H._REDACT_CACHE_MAX_TEXT_LEN)
+    assert H._REDACT_BIG_TIER_CAP == H._REDACT_MEMO_BYTE_BUDGET // (2 * H._REDACT_TEXT_BIG_CACHE_MAX)

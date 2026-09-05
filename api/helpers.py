@@ -493,6 +493,14 @@ except Exception:
     _REDACT_RULES_AGENT_DIGEST = None
 
 
+# Per-entry max sizes (bytes) for the two memo tiers — the SAME values the
+# caches enforce below. Defined here (single source of truth) so the per-tier
+# byte-budget ceilings below are derived from them and can't silently drift if
+# an entry cap is tuned later. Small tier: <= 16 KiB. Big tier: <= 256 KiB.
+# Strings above the big cap bypass the decision cache entirely (still redacted).
+_REDACT_CACHE_MAX_TEXT_LEN = 16384
+_REDACT_TEXT_BIG_CACHE_MAX = 262144
+
 # Per-tier entry ceilings so a raised env knob can't exceed a bounded byte
 # footprint. A SHARED count cap would let the 256KiB big tier retain ~32GiB at a
 # 131072-entry ceiling while the 16KiB small tiers hold a fraction of that
@@ -501,10 +509,8 @@ except Exception:
 # 2048. Defaults (16384/16384/256) sit below these; env knobs stay tunable but
 # never balloon.
 _REDACT_MEMO_BYTE_BUDGET = 1024 * 1024 * 1024  # 1 GiB per tier (keys+values)
-_REDACT_MEMO_SMALL_ENTRY = 16384               # == _REDACT_CACHE_MAX_TEXT_LEN
-_REDACT_MEMO_BIG_ENTRY = 262144                # == _REDACT_TEXT_BIG_CACHE_MAX
-_REDACT_SMALL_TIER_CAP = _REDACT_MEMO_BYTE_BUDGET // (2 * _REDACT_MEMO_SMALL_ENTRY)
-_REDACT_BIG_TIER_CAP = _REDACT_MEMO_BYTE_BUDGET // (2 * _REDACT_MEMO_BIG_ENTRY)
+_REDACT_SMALL_TIER_CAP = _REDACT_MEMO_BYTE_BUDGET // (2 * _REDACT_CACHE_MAX_TEXT_LEN)
+_REDACT_BIG_TIER_CAP = _REDACT_MEMO_BYTE_BUDGET // (2 * _REDACT_TEXT_BIG_CACHE_MAX)
 
 
 def _lru_size(default: int, env: str, cap: int) -> int:
@@ -536,11 +542,6 @@ def _lru_size(default: int, env: str, cap: int) -> int:
 _redact_fn_lru = functools.lru_cache(
     maxsize=_lru_size(16384, "HERMES_WEBUI_REDACT_FN_MEMO", _REDACT_SMALL_TIER_CAP)
 )(_redact_fn_uncached)
-
-# Cap per-entry size so a handful of giant tool-output dumps can't evict the
-# thousands of small recurring strings that actually benefit, or balloon RSS.
-_REDACT_CACHE_MAX_TEXT_LEN = 16384
-
 
 def _redact_fn_cached(text):
     if len(text) > _REDACT_CACHE_MAX_TEXT_LEN:
@@ -575,7 +576,6 @@ _redact_text_lru = functools.lru_cache(
 _redact_text_big_lru = functools.lru_cache(
     maxsize=_lru_size(256, "HERMES_WEBUI_REDACT_BIG_DECISION_MEMO", _REDACT_BIG_TIER_CAP)
 )(_redact_text_impl)
-_REDACT_TEXT_BIG_CACHE_MAX = 262144
 
 
 _SENSITIVE_CASE_MARKERS = (
