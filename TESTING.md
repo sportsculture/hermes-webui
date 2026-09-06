@@ -162,6 +162,62 @@ To widen the guard, fix the pre-existing intentional hits first (as of 2026-05-3
 
 ---
 
+## Gateway steer and workspace parity
+
+Gateway steer relay and workspace propagation have dedicated regression coverage
+plus manual rows. These are **not** covered by the public conversation lifecycle
+gate above; do not treat that script as proof for these behaviors.
+
+Automated coverage:
+
+- `tests/test_gateway_steer_relay.py` — direct steer relay coverage: exact
+  request URL/body and run-id quoting, the bounded startup wait (pending then
+  ready, pending timeout, terminal/no-id states), HTTP 404/405/410 queue mapping
+  versus 409 / other-HTTP / exception draft-failure mapping, waiter cleanup,
+  and stream-scoped routing with multiple active runs.
+- `tests/test_gateway_workspace_relay.py` — workspace containment matrix
+  (realpath, exact root, sibling-prefix / traversal / symlink rejection, empty
+  input) and per-session `workspace` inclusion or omission in the actual
+  `POST /v1/runs` request body.
+- Existing neighbors that must stay green: `tests/test_real_steer.py`,
+  `tests/test_1062_busy_input_modes.py`, `tests/test_5145_steer_default.py`,
+  `tests/test_issue4749_steer_reason_and_recovery.py`, and the gateway suites
+  `tests/test_gateway_approval_runs_api.py`,
+  `tests/test_webui_gateway_chat_backend.py`,
+  `tests/test_gateway_approval_legacy_path.py`.
+
+```bash
+./scripts/test.sh -q tests/test_gateway_steer_relay.py tests/test_gateway_workspace_relay.py \
+  tests/test_real_steer.py tests/test_issue4749_steer_reason_and_recovery.py \
+  tests/test_1062_busy_input_modes.py tests/test_5145_steer_default.py \
+  tests/test_gateway_approval_runs_api.py tests/test_webui_gateway_chat_backend.py \
+  tests/test_gateway_approval_legacy_path.py
+```
+
+Manual verification rows (use isolated `HERMES_HOME` / `HERMES_WEBUI_STATE_DIR`
+and a fake gateway or mocked relay — never a real user's sessions):
+
+| Row | Expect |
+| --- | --- |
+| Steer delivery on an active Runs-API run | Guidance POSTed to `/v1/runs/{run_id}/steer`; delivered indicator; no queue, no draft restore |
+| Run id pending, published within five seconds | Steer waits, then relays exactly once to the published id |
+| Run id pending past the wait budget | Steer reports unavailable; draft kept for retry; no HTTP request |
+| Steer answered 404, 405, or 410 | Text queued exactly once for the owning session's next turn; run not cancelled |
+| Steer answered 409, auth failure, 500, or network error | Draft and attached files restored with a translated recovery message; no automatic queue |
+| Session switch with pending files after a failure | Guidance and files stay with the original owning session; the new session's files are untouched |
+| Session workspace at/below `/workspace` | `workspace` present in the `POST /v1/runs` body |
+| Session workspace outside `/workspace` (sibling, `..`, symlink) | `workspace` omitted; gateway default applies |
+| Local (non-gateway) steer happy path, failure, and leftover queue | Unchanged from existing local behavior |
+
+Evidence requirements for changes touching this behavior: before/after UI
+captures at desktop 1440px, narrow 768px, and mobile 390px; English plus one
+translated locale for the recovery copy; and isolated state with a fake gateway
+fixture for all local trials. The agent-side steer endpoint and its consumption
+of the `workspace` field are not verified in this repository; record what was
+validated against mocks only, and list any row not performed.
+
+---
+
 ## How to Use This Document
 
 Each test has:

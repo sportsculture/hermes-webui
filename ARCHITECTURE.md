@@ -328,6 +328,31 @@ on_tool callback:
 The approval surface-on-tool logic means approvals appear immediately after the tool
 fires (within the same SSE stream), without waiting for the next poll cycle.
 
+### 4.4a Gateway Chat Invocation (_run_gateway_chat_streaming)
+
+When HERMES_WEBUI_CHAT_BACKEND=gateway, browser turns run through
+_run_gateway_chat_streaming in api/gateway_chat.py instead of the in-process
+agent path in 4.4. Runtime ownership moves to the gateway; WebUI retains the
+browser API, SSE, and session surface.
+
+- Steer routing decides active-run backend ownership (ACTIVE_RUNS) before
+  consulting the local SESSION_AGENT_CACHE, so a confirmed gateway-owned run
+  never falls through to a stale cached local agent. An exception during the
+  ownership lookup fails closed: the request reports steer_error and no local
+  steering is attempted.
+- The gateway worker publishes its run id into _STREAM_RUN_IDS with a
+  pending -> ready/failed/fallback lifecycle under
+  _STREAM_RUN_STARTING_CONDITION, and retires that state when the owner
+  finishes. Steer borrows the id through the locked bounded wait (up to five
+  seconds during run startup), holds no registry locks across HTTP I/O, and
+  releases its temporary waiter reference on every exit.
+- On the Runs API path, the POST /v1/runs body includes the session's
+  canonical workspace only when it resolves at or below /workspace; other
+  paths omit the field and final filesystem validation stays gateway-side.
+
+Operator-facing behavior (queue/draft policy for steer failures, container
+path agreement) is documented in docs/advanced-chat-setup.md.
+
 ### 4.5 Approval System Integration
 
 The approval system uses the existing Hermes gateway module at tools/approval.py.
