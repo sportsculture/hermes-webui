@@ -12902,6 +12902,16 @@ def _handle_chat_steer(handler, body: dict) -> bool:
     of the tool output on its next iteration. The user's stream is NOT
     interrupted.
 
+    If the active stream is owned by the gateway backend, the steer is
+    relayed to the gateway run (api.gateway_chat.gateway_steer_run) and the
+    relay's (accepted, reason) is surfaced verbatim; the browser's
+    owner-scoped queue branch on ``gateway_steer_queued`` (relay HTTP
+    404/405/410, i.e. a missing/unsupported steer endpoint or a retired run)
+    is the narrow exception to the generic non-cancelling failure rule — it
+    preserves the text for a subsequent turn without claiming the server
+    queued or applied anything. An ownership lookup failure fails closed
+    with ``steer_error`` and NEVER falls through to a cached local agent.
+
     If no agent is cached, the agent is too old to support steer, or no
     stream is active, return {"accepted": False, "fallback": "<reason>"}.
     The frontend must surface that failure without cancelling the active run;
@@ -12932,17 +12942,16 @@ def _handle_chat_steer(handler, body: dict) -> bool:
     except KeyError:
         _active_stream_id = None
     if _active_stream_id:
+        # Narrow guard: only the ownership registry snapshot is protected.
+        # Any failure here fails closed — a stale cached local agent must
+        # never swallow a steer that might belong to a gateway run.
         try:
             with _cfg.STREAMS_LOCK:
                 _stream_alive = _active_stream_id in _cfg.STREAMS
+            _active_run = {}
             if _stream_alive:
                 with _cfg.ACTIVE_RUNS_LOCK:
                     _active_run = dict((_cfg.ACTIVE_RUNS or {}).get(str(_active_stream_id)) or {})
-                if _active_run.get("backend") == "gateway":
-                    from api.gateway_chat import gateway_steer_run
-                    accepted, reason = gateway_steer_run(str(_active_stream_id), text)
-                    return j(handler, {"accepted": accepted, "fallback": reason,
-                                       "stream_id": _active_stream_id})
         except Exception:
             logger.warning(
                 "Gateway ownership lookup failed before steer for session=%s stream_id=%s",
@@ -12950,6 +12959,22 @@ def _handle_chat_steer(handler, body: dict) -> bool:
                 _active_stream_id,
                 exc_info=True,
             )
+            return j(handler, {"accepted": False, "fallback": "steer_error",
+                               "stream_id": _active_stream_id})
+        if _stream_alive and _active_run.get("backend") == "gateway":
+            accepted, reason = False, "gateway_steer_error"
+            try:
+                from api.gateway_chat import gateway_steer_run
+                accepted, reason = gateway_steer_run(str(_active_stream_id), text)
+            except Exception:
+                logger.warning(
+                    "Gateway steer relay raised for session=%s stream_id=%s",
+                    sid,
+                    _active_stream_id,
+                    exc_info=True,
+                )
+            return j(handler, {"accepted": accepted, "fallback": reason,
+                               "stream_id": _active_stream_id})
 
     evicted_cached_entry = None
     with _cfg.SESSION_AGENT_CACHE_LOCK:

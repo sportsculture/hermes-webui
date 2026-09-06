@@ -152,36 +152,60 @@ def gateway_steer_run(stream_id: str, text: str):
     """Relay a /steer payload to the active gateway run for ``stream_id``.
 
     Gateway-mode turns run in the gateway process, so there is no local
-    AIAgent to steer. POST the guidance to the gateway's runs API
-    (POST /v1/runs/{run_id}/steer), which applies it at the next tool-result
-    boundary exactly like an in-process agent.steer(). Returns ``(ok, reason)``
-    where ``reason`` is None on success or a stable fallback key for the UI.
+    AIAgent to steer. Resolve the run id via the bounded lifecycle wait
+    (``wait_for_gateway_run_id``) so a steer sent during run startup waits
+    for publication instead of failing immediately, then POST the guidance
+    to the gateway's runs API (POST /v1/runs/{run_id}/steer). The gateway
+    applies it at its next tool-result boundary exactly like an in-process
+    agent.steer().
+
+    Returns ``(ok, reason)`` where ``reason`` is None on success or a stable
+    fallback key for the UI. ``ok`` means the steer was delivered to the
+    gateway endpoint, NOT proven to have been applied to the run — the
+    gateway owns acceptance and application.
+
+    Outcomes:
+      - No usable run id after lifecycle resolution (pending timeout,
+        failed/fallback phase, or absent state): ``gateway_steer_no_run_id``,
+        no HTTP call is made.
+      - HTTP 404/405/410: ``gateway_steer_queued`` — the endpoint is missing
+        or the run is gone; the browser may queue the text for a later turn.
+        This does not cancel the active run and does not claim the server
+        queued anything.
+      - HTTP 409: ``gateway_steer_not_accepting``.
+      - Other HTTP statuses: ``gateway_steer_http_<status>``.
+      - Resolution/request exceptions: ``gateway_steer_error``.
     """
     try:
-        run_id = str((_STREAM_RUN_IDS or {}).get(stream_id) or "").strip()
+        _structured_gateway, run_id = wait_for_gateway_run_id(
+            str(stream_id or ""), GATEWAY_RUN_ID_WAIT_TIMEOUT
+        )
+        run_id = str(run_id or "").strip()
     except Exception:
-        run_id = ""
+        logger.debug("Gateway run-id resolution failed for stream %s", stream_id, exc_info=True)
+        return False, "gateway_steer_error"
     if not run_id:
         return False, "gateway_steer_no_run_id"
     try:
-        import json as _json
-        import urllib.error as _urllib_error
-        import urllib.request as _urllib_request
-
-        url = f"{_gateway_base_url().rstrip('/')}/v1/runs/{run_id}/steer"
-        req = _urllib_request.Request(
+        url = (
+            f"{_gateway_base_url().rstrip('/')}/v1/runs/"
+            f"{urllib.parse.quote(run_id, safe='')}/steer"
+        )
+        req = urllib.request.Request(
             url,
-            data=_json.dumps({"text": str(text or "")}).encode("utf-8"),
+            data=json.dumps({"text": str(text or "")}).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {_gateway_api_key()}",
             },
             method="POST",
         )
-        with _urllib_request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             resp.read()
         return True, None
-    except _urllib_error.HTTPError as e:
+    except urllib.error.HTTPError as e:
+        if e.code in {404, 405, 410}:
+            return False, "gateway_steer_queued"
         if e.code == 409:
             return False, "gateway_steer_not_accepting"
         return False, f"gateway_steer_http_{e.code}"
@@ -193,7 +217,7 @@ _WORKSPACE_RELAY_ROOT = "/workspace"
 
 
 def _gateway_workspace_for_relay(workspace):
-    """Return a normalized workspace path ONLY when it is strictly contained
+    """Return a normalized workspace path ONLY when it is at or contained
     under the shared workspace root; None otherwise.
 
     ``str.startswith("/workspace")`` is not a containment check: it accepts
@@ -1247,14 +1271,13 @@ def _run_gateway_chat_streaming(
                     if _payload_event in {"hermes.approval.request", "approval.request"}:
                         approval_data = _gateway_runs_approval_event(payload)
                         if approval_data:
-                            # Record the gateway run_id so /api/approval/respond
-                            # can relay the choice back and resume the parked run
-                            # (legacy path never creates a local run; without this
-                            # the card renders but approve/deny returns ok:false).
-                            # No-op when the payload omits run_id.
+                            # Record the gateway run_id so /api/approval/respond can
+                            # relay the choice back and resume the parked run (legacy
+                            # path has no local run). No-op when run_id is omitted.
                             _approval_run_id = str(approval_data.get("run_id") or "").strip()
                             if _approval_run_id:
-                                _STREAM_RUN_IDS[stream_id] = _approval_run_id
+                                with _STREAM_RUN_STARTING_CONDITION:
+                                    _STREAM_RUN_IDS[stream_id] = _approval_run_id
                             try:
                                 from api.route_approvals import submit_gateway_pending_mirror
                                 head, total = submit_gateway_pending_mirror(session_id, approval_data)
@@ -1539,7 +1562,8 @@ def _run_gateway_chat_streaming(
             "hint": "Check HERMES_WEBUI_GATEWAY_BASE_URL and Gateway API server health.",
         })
     finally:
-        mapped_run_id = str(_STREAM_RUN_IDS.get(stream_id) or "").strip()
+        with _STREAM_RUN_STARTING_CONDITION:
+            mapped_run_id = str(_STREAM_RUN_IDS.get(stream_id) or "").strip()
         if mapped_run_id:
             try:
                 from api.route_approvals import retire_gateway_pending_mirror
