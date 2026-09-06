@@ -189,6 +189,34 @@ def gateway_steer_run(stream_id: str, text: str):
         return False, "gateway_steer_error"
 
 
+_WORKSPACE_RELAY_ROOT = "/workspace"
+
+
+def _gateway_workspace_for_relay(workspace):
+    """Return a normalized workspace path ONLY when it is strictly contained
+    under the shared workspace root; None otherwise.
+
+    ``str.startswith("/workspace")`` is not a containment check: it accepts
+    ``/workspace-other`` and ``/workspace/../etc``, and a symlink inside the
+    tree can point anywhere. Realpath the candidate and the root, then require
+    ``candidate == root`` or under ``root + os.sep``. The gateway is expected
+    to re-validate containment in ITS OWN filesystem before honoring the path.
+    """
+    try:
+        raw = str(workspace or "").strip()
+        if not raw:
+            return None
+        if not raw.startswith(_WORKSPACE_RELAY_ROOT):
+            return None
+        root = os.path.realpath(_WORKSPACE_RELAY_ROOT)
+        cand = os.path.realpath(raw)
+        if cand == root or cand.startswith(root + os.sep):
+            return cand
+    except Exception:
+        return None
+    return None
+
+
 _WEBUI_CHAT_BACKEND_ENV = "HERMES_WEBUI_CHAT_BACKEND"
 _WEBUI_GATEWAY_BASE_URL_ENV = "HERMES_WEBUI_GATEWAY_BASE_URL"
 _WEBUI_GATEWAY_API_KEY_ENV = "HERMES_WEBUI_GATEWAY_API_KEY"
@@ -670,11 +698,12 @@ def _run_gateway_runs_api_streaming(
         }
         # C1: propagate the webui session's workspace so gateway tool execution
         # runs in the SAME directory the browser shows (the runs path otherwise
-        # falls back to the gateway's $HOME, so file/tool turns write to the
-        # wrong place). Only send paths under the shared workspace root; a raw
-        # sidecar path outside /workspace must not steer the gateway's cwd.
-        run_workspace = str(workspace or "").strip()
-        if run_workspace.startswith("/workspace"):
+        # falls back to the gateway's $HOME). Only forward paths that RESOLVE
+        # inside the shared workspace root (realpath + containment, rejecting
+        # sibling prefixes, .. escapes and symlink escapes); the gateway must
+        # re-validate containment in its own mount before honoring the path.
+        run_workspace = _gateway_workspace_for_relay(workspace)
+        if run_workspace:
             run_body["workspace"] = run_workspace
         if instructions_parts:
             run_body["instructions"] = "\n\n".join(part for part in instructions_parts if part)

@@ -12921,6 +12921,36 @@ def _handle_chat_steer(handler, body: dict) -> bool:
     if not text:
         return bad(handler, "text required")
 
+    # Resolve the session's active stream and run OWNER before consulting the
+    # cached in-process agent. A stale cached agent (e.g. a session that ran
+    # in-process before the backend flipped to gateway) must never swallow a
+    # steer meant for the active gateway run.
+    _active_stream_id = None
+    try:
+        _s_for_steer = get_session(sid)
+        _active_stream_id = getattr(_s_for_steer, "active_stream_id", None) or None
+    except KeyError:
+        _active_stream_id = None
+    if _active_stream_id:
+        try:
+            with _cfg.STREAMS_LOCK:
+                _stream_alive = _active_stream_id in _cfg.STREAMS
+            if _stream_alive:
+                with _cfg.ACTIVE_RUNS_LOCK:
+                    _active_run = dict((_cfg.ACTIVE_RUNS or {}).get(str(_active_stream_id)) or {})
+                if _active_run.get("backend") == "gateway":
+                    from api.gateway_chat import gateway_steer_run
+                    accepted, reason = gateway_steer_run(str(_active_stream_id), text)
+                    return j(handler, {"accepted": accepted, "fallback": reason,
+                                       "stream_id": _active_stream_id})
+        except Exception:
+            logger.warning(
+                "Gateway ownership lookup failed before steer for session=%s stream_id=%s",
+                sid,
+                _active_stream_id,
+                exc_info=True,
+            )
+
     evicted_cached_entry = None
     with _cfg.SESSION_AGENT_CACHE_LOCK:
         cached = _cfg.SESSION_AGENT_CACHE.get(sid)
@@ -12940,32 +12970,9 @@ def _handle_chat_steer(handler, body: dict) -> bool:
         except Exception:
             logger.debug("Failed to close steer identity-mismatched cached agent for session %s", sid, exc_info=True)
     if not cached:
-        try:
-            s = get_session(sid)
-            active_stream_id = getattr(s, "active_stream_id", None) or None
-        except KeyError:
-            active_stream_id = None
-        if active_stream_id:
-            with _cfg.STREAMS_LOCK:
-                stream_alive = active_stream_id in _cfg.STREAMS
-            if stream_alive:
-                try:
-                    with _cfg.ACTIVE_RUNS_LOCK:
-                        active_run = dict((_cfg.ACTIVE_RUNS or {}).get(str(active_stream_id)) or {})
-                    if active_run.get("backend") == "gateway":
-                        from api.gateway_chat import gateway_steer_run
-                        accepted, reason = gateway_steer_run(str(active_stream_id), text)
-                        return j(handler, {"accepted": accepted, "fallback": reason,
-                                           "stream_id": active_stream_id})
-                except Exception:
-                    logger.warning(
-                        "Gateway ownership lookup failed before steer fallback for session=%s stream_id=%s",
-                        sid,
-                        active_stream_id,
-                        exc_info=True,
-                    )
-        # No active local agent for this session — caller surfaces a steer failure
-        # without cancelling the active run.
+        # No active local agent for this session (the gateway-owned path was
+        # already handled above) — caller surfaces a steer failure without
+        # cancelling the active run.
         return j(handler, {"accepted": False, "fallback": "no_cached_agent",
                            "stream_id": None})
     agent = cached[0]
