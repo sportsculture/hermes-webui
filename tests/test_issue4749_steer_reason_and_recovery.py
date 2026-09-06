@@ -169,7 +169,7 @@ def _handler_fallback_literals(fn_node):
     for node in ast.walk(fn_node):
         if not isinstance(node, ast.Dict):
             continue
-        for key, value in zip(node.keys, node.values):
+        for key, value in zip(node.keys, node.values, strict=True):
             if not (isinstance(key, ast.Constant) and key.value == "fallback"):
                 continue
             if isinstance(value, ast.Constant):
